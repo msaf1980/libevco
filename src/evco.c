@@ -8,17 +8,14 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
-#ifndef WIN32
-#include <ucontext.h>
-#else
 #include <sys/types.h>
 #include <sys/socket.h>
-#endif
 #include <unistd.h>
 
 #include "list.h"
 #include "hashtab.h"
 #include "event2/event.h"
+#include "coro.h"
 #include "evco.h"
 
 #ifdef DEBUG
@@ -38,23 +35,13 @@ struct evsc
 
 struct evco
 {
-#ifdef WIN32
-	void *prev;
-	void *self;
-#else
-	ucontext_t prev;
-	ucontext_t self;
-#endif
+	coro_context *prev;
 	struct event *timer;
 	int flag_iotimeout;
 	int flag_running;
 	evsc_t *psc;
-	size_t stack_size;
-#ifdef WIN32
-	evco_func func;
-#else
-	char *stack;
-#endif
+	coro_context ctx;
+	struct coro_stack stack;
 };
 
 typedef struct fd_item
@@ -81,7 +68,7 @@ struct evco_cond
 };
 
 #ifdef WIN32
-__declspec( thread ) evco_t *g_current_pco = NULL;
+declspec( thread ) evco_t *g_current_pco = NULL;
 #else
 __thread evco_t *g_current_pco = NULL;
 #endif
@@ -124,13 +111,9 @@ evsc_t *evsc_alloc()
 	psc->ev_base = event_base_new();
 	psc->fd_tb = hashtab_alloc();
 	INIT_LIST_HEAD(&psc->cond_ready_queue);
-#ifdef WIN32
-	ConvertThreadToFiber(NULL);
-#endif
 	return psc;
 }
 
-#ifdef WIN32
 #define __evco_free(pco) \
 do {							\
 	if ( !pco ) break;			\
@@ -138,21 +121,9 @@ do {							\
 		event_del(pco->timer);	\
 		event_free(pco->timer); \
 	}							\
-	DeleteFiber(pco->self);		\
+	coro_stack_free(&pco->stack);	\
 	FREE_POINTER(pco);			\
 } while ( 0 )
-#else
-#define __evco_free(pco) \
-do {							\
-	if ( !pco ) break;			\
-	if ( pco->timer ) {			\
-		event_del(pco->timer);	\
-		event_free(pco->timer); \
-	}							\
-	FREE_POINTER(pco->stack);	\
-	FREE_POINTER(pco);			\
-} while ( 0 )
-#endif
 
 #ifdef WIN32
 void CALLBACK __evco_entry(void *args)
@@ -183,38 +154,21 @@ static fd_item_t *__fd_item_alloc(evsc_t *psc, int fd)
 static void __evco_resume(evco_t *pco)
 {
 	int ret = 0;
-	evco_t *prev_pco = g_current_pco;
-	g_current_pco = pco;
-#ifdef WIN32
-	pco->prev = GetCurrentFiber();
-	if ( pco->prev == NULL ) {
-		ret = -1;
+	if (g_current_pco != NULL) {
+		evco_t *prev_pco = g_current_pco;
+		g_current_pco = pco;
+		coro_transfer(pco->prev, &pco->ctx);
+		g_current_pco = prev_pco;
 	}
-	else{
-		SwitchToFiber(pco->self);
-	}
-#else
-	ret = swapcontext(&pco->prev, &pco->self);
-#endif
-	g_current_pco = prev_pco;
-	if ( ret != 0 ) {
-		evco_debug("swapcontext failed...\n");
-		__evco_free(pco);		
-	}
-	else {
-		if ( pco->flag_running == 0 ) {
-			__evco_free(pco);
-		}
+	if ( pco->flag_running == 0 ) {
+		__evco_free(pco);
 	}
 }
+
 static void inline __evco_yield()
 {
     g_current_pco->flag_iotimeout = 0;
-#ifdef WIN32
-	SwitchToFiber(g_current_pco->prev);
-#else
-	swapcontext(&g_current_pco->self, &g_current_pco->prev);
-#endif
+	coro_transfer(&g_current_pco->ctx, g_current_pco->prev);
 }
 
 static void __evco_yield_by_fd(int fd, int flag, unsigned int to_msec)
@@ -240,7 +194,7 @@ static void __evco_yield_by_fd(int fd, int flag, unsigned int to_msec)
 	else {
 		struct timeval tv;
 		msec2tv(to_msec, tv);
-		ret = event_add(pev, &tv);	
+		ret = event_add(pev, &tv);
 	}
 	if ( ret < 0 ) {
 		evco_debug("event_add failed...\n");
@@ -295,38 +249,23 @@ void evco_sleep(int msec)
 evco_t *evco_create(evsc_t *psc, size_t stack_size, evco_func func, void *args)
 {
 	evco_t *pco = (evco_t *)malloc(sizeof(evco_t));
-#ifdef WIN32
-	pco->func = func;
+	if (pco == NULL) {
+		evco_debug("alloc pco failed...\n");
+		return NULL;
+	}
+	if (!coro_stack_alloc(&pco->stack, stack_size)) {
+		evco_debug("alloc pco stack failed...\n");
+		FREE_POINTER(pco);
+		return NULL;
+	}
+    coro_create(&pco->ctx, func, args, pco->stack.sptr, pco->stack.ssze);
+
 	pco->flag_running = 1;
-	pco->stack_size = stack_size;
 	pco->psc = psc;
 	pco->timer = NULL;
-	pco->self = CreateFiber(stack_size, __evco_entry, args);
-	if ( pco->self == NULL ) {
-		evco_debug("CreateFiber failed...\n");
-		goto _E1;
-	}
-#else
-	if ( getcontext(&pco->self) == -1 ) {
-		evco_debug("getcontext faild..\n");
-		goto _E1;
-	}
-	pco->flag_running = 1;
-	pco->stack = (char *)malloc(stack_size);
-	pco->stack_size = stack_size;
-	pco->self.uc_stack.ss_sp = pco->stack;
-	pco->self.uc_stack.ss_size = stack_size;
-	pco->self.uc_link = &pco->prev;
-	pco->psc = psc;
-	pco->timer = NULL;
-	makecontext(&pco->self, (void (*)(void))__evco_entry, 2, func, args);
-#endif
 	__evco_resume(pco);
-	
+
 	return pco;
-_E1:
-	FREE_POINTER(pco);
-	return NULL;
 }
 
 int evco_timed_connect(int fd, const struct sockaddr *addr, socklen_t addrlen, int msec)
